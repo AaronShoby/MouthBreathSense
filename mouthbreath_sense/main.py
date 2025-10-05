@@ -1,7 +1,4 @@
-﻿import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-
-from src.train import train
+﻿from src.train import train
 from src.evaluate import evaluate
 from src.inference import predict
 import numpy as np
