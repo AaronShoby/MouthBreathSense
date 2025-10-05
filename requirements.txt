@@ -1,0 +1,12 @@
+torch
+torchvision
+onnx
+onnxruntime
+scikit-learn
+pandas
+numpy
+matplotlib
+fastapi
+uvicorn
+pyyaml 
+seaborn 
