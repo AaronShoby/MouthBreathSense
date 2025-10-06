@@ -1,101 +1,161 @@
 ﻿import os
-import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from src.dataset import load_dataset
-from src.utils import save_model, plot_training_curve
+from torch.utils.data import DataLoader
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
+import numpy as np
+import matplotlib.pyplot as plt
+from src.dataset import prepare_datasets, FeatureConfig, LoaderConfig
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def _project_root():
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# -------------------------------
+# CNN-GRU Model
+# -------------------------------
+class CNN_GRU(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(CNN_GRU, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
 
-
-def _load_config():
-    cfg_path = os.path.join(_project_root(), 'config.yaml')
-    print(f"[train] Loading config from {cfg_path}")
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
-
-
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes: int = 2):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(8, 16, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
         )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(16 * 7 * 7, num_classes),
+
+        self.gru = nn.GRU(input_size=128, hidden_size=64, num_layers=1, batch_first=True, bidirectional=True)
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        x = self.cnn(x)
+        x = x.permute(0, 2, 1)  # [B, T, C]
+        out, _ = self.gru(x)
+        out = out.mean(dim=1)
+        return self.fc(out)
+
+# -------------------------------
+# Training utilities
+# -------------------------------
+def train_one_epoch(model, dataloader, optimizer, criterion):
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+    for batch in dataloader:
+        x, y = batch["x"].to(DEVICE), batch["y"].to(DEVICE)
+        optimizer.zero_grad()
+        outputs = model(x)
+        loss = criterion(outputs, y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x.size(0)
+        preds = torch.argmax(outputs, dim=1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+
+    return running_loss / total, correct / total
 
 
-def train():
-    cfg = _load_config()
-    batch_size = int(cfg.get('batch_size', 16))
-    lr = float(cfg.get('learning_rate', 1e-3))
-    epochs = int(cfg.get('epochs', 3))
-    model_path = os.path.join(_project_root(), cfg.get('model_path', 'models/model.onnx'))
+def evaluate(model, dataloader, criterion):
+    model.eval()
+    running_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
 
-    print("[train] Preparing data loaders...")
-    train_loader, _ = load_dataset(batch_size=batch_size)
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch["x"].to(DEVICE), batch["y"].to(DEVICE)
+            outputs = model(x)
+            loss = criterion(outputs, y)
+            running_loss += loss.item() * x.size(0)
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
 
-    # Device selection
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type == "cuda":
-        print(f"[train] Using GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
-    else:
-        print("[train] Using CPU")
+    acc = correct / total
+    return running_loss / total, acc, np.array(all_labels), np.array(all_preds)
 
-    model = SimpleCNN(num_classes=2).to(device)
+
+# -------------------------------
+# Main training pipeline
+# -------------------------------
+def main():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    feat_cfg = FeatureConfig(sample_rate=16000, duration=5.0, n_mels=64, n_mfcc=40)
+    load_cfg = LoaderConfig(batch_size=16, num_workers=4, val_split=0.1, test_split=0.1)
+
+    print("[train] Preparing datasets...")
+    train_ds, val_ds, test_ds, meta = prepare_datasets(repo_root, feat_cfg, load_cfg, include_icbhi=False)
+    print("[train] Dataset ready:", meta)
+
+    in_channels = meta["feature_shape"][0]
+    num_classes = len(meta["classes"])
+
+    train_dl = DataLoader(train_ds, batch_size=load_cfg.batch_size, shuffle=True, num_workers=load_cfg.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=load_cfg.batch_size, shuffle=False, num_workers=load_cfg.num_workers)
+    test_dl = DataLoader(test_ds, batch_size=load_cfg.batch_size, shuffle=False, num_workers=load_cfg.num_workers)
+
+    model = CNN_GRU(in_channels=in_channels, num_classes=num_classes).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    epochs = 15
 
-    loss_history = []
+    best_val_acc = 0
+    model_dir = os.path.join(repo_root, "mouthbreath_sense", "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    print(f"[train] Using device: {DEVICE.upper()} ({torch.cuda.get_device_name(0) if DEVICE == 'cuda' else 'CPU'})")
+
     for epoch in range(1, epochs + 1):
-        model.train()
-        running_loss = 0.0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        train_loss, train_acc = train_one_epoch(model, train_dl, optimizer, criterion)
+        val_loss, val_acc, _, _ = evaluate(model, val_dl, criterion)
+        print(f"Epoch [{epoch}/{epochs}] | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), os.path.join(model_dir, "best_model.pt"))
 
-            running_loss += loss.item() * inputs.size(0)
-        epoch_loss = running_loss / len(train_loader.dataset)
-        loss_history.append(epoch_loss)
-        print(f"[train] Epoch {epoch}/{epochs} - loss: {epoch_loss:.4f}")
+    print("\n✅ Training complete. Best Val Acc:", best_val_acc)
+
+    # Test evaluation
+    print("\n🔍 Evaluating on test set...")
+    model.load_state_dict(torch.load(os.path.join(model_dir, "best_model.pt")))
+    test_loss, test_acc, labels, preds = evaluate(model, test_dl, criterion)
+    print(f"Test Accuracy: {test_acc:.4f}")
+
+    # Confusion matrix
+    cm = confusion_matrix(labels, preds)
+    print("\nConfusion Matrix:\n", cm)
+    plt.imshow(cm, cmap='Blues')
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.savefig(os.path.join(model_dir, "confusion_matrix.png"))
+    plt.close()
+
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(labels, preds, target_names=meta["classes"]))
 
     # Export to ONNX
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    dummy = torch.randn(1, 1, 28, 28, device=device)
-    print(f"[train] Exporting model to ONNX at {model_path}")
+    dummy_input = torch.randn(1, in_channels, 313).to(DEVICE)
+    onnx_path = os.path.join(model_dir, "model.onnx")
     torch.onnx.export(
-        model,
-        dummy,
-        model_path,
-        export_params=True,
-        opset_version=11,
-        do_constant_folding=True,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
+        model, dummy_input, onnx_path,
+        input_names=["input"], output_names=["output"],
+        opset_version=13
     )
-    print("[train] Training complete and model exported.")
+    print(f"\n🧠 ONNX model exported successfully → {onnx_path}")
 
-
-if __name__ == '__main__':
-    train()
+if __name__ == "__main__":
+    main()

@@ -1,16 +1,43 @@
+# =====================================
+# Python + ML + VSCode project ignore
+# =====================================
+
 # Virtual environment
 .venv/
-
-# Python cache
-__pycache__/
-*.pyc
+venv/
+ENV/
+env/
 
 # Datasets
-data/raw/*
-data/processed/*
+data/raw/
+data/processed/
+*.wav
+*.webm
+*.csv
 
-# Models
-models/*
+# Checkpoints and models
+models/
+*.onnx
+*.pt
+*.pth
 
-# Notebook checkpoints
-*.ipynb_checkpoints/
+# Notebooks and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints
+
+# Logs and temp
+logs/
+*.log
+tmp/
+*.tmp
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,83 +1,119 @@
 ﻿import os
-import yaml
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from sklearn.metrics import confusion_matrix, classification_report
 import numpy as np
-import onnxruntime as ort
-from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
 import matplotlib.pyplot as plt
-import seaborn as sns
+from src.dataset import prepare_datasets, FeatureConfig, LoaderConfig
 
-from src.dataset import load_dataset
-from src.utils import load_model
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# -------------------------------
+# CNN-GRU model (same as in train.py)
+# -------------------------------
+class CNN_GRU(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(CNN_GRU, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
 
-def _project_root():
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
+        )
 
+        self.gru = nn.GRU(input_size=128, hidden_size=64, num_layers=1,
+                          batch_first=True, bidirectional=True)
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
 
-def _load_config():
-    cfg_path = os.path.join(_project_root(), 'config.yaml')
-    print(f"[evaluate] Loading config from {cfg_path}")
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    def forward(self, x):
+        x = self.cnn(x)
+        x = x.permute(0, 2, 1)
+        out, _ = self.gru(x)
+        out = out.mean(dim=1)
+        return self.fc(out)
 
+# -------------------------------
+# Evaluation function
+# -------------------------------
+def evaluate(model, dataloader, criterion):
+    model.eval()
+    total_loss, total, correct = 0.0, 0, 0
+    all_preds, all_labels = [], []
 
-def evaluate():
-    cfg = _load_config()
-    model_path = os.path.join(_project_root(), cfg.get('model_path', 'models/model.onnx'))
-    batch_size = int(cfg.get('batch_size', 16))
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch["x"].to(DEVICE), batch["y"].to(DEVICE)
+            outputs = model(x)
+            loss = criterion(outputs, y)
 
-    print(f"[evaluate] Creating test data loader (batch_size={batch_size})...")
-    _, test_loader = load_dataset(batch_size=batch_size)
+            total_loss += loss.item() * x.size(0)
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
 
-    print(f"[evaluate] Loading ONNX model: {model_path}")
-    sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-    input_name = sess.get_inputs()[0].name
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy, np.array(all_labels), np.array(all_preds)
 
-    y_true = []
-    y_pred = []
+# -------------------------------
+# Main evaluation script
+# -------------------------------
+def main():
+    print("[evaluate] Starting evaluation...")
 
-    for inputs, targets in test_loader:
-        np_inp = inputs.numpy().astype(np.float32)
-        outputs = sess.run(None, {input_name: np_inp})[0]
-        preds = np.argmax(outputs, axis=1)
-        y_true.extend(targets.numpy().tolist())
-        y_pred.extend(preds.tolist())
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    model_path = os.path.join(repo_root, "mouthbreath_sense", "models", "best_model.pt")
+    feat_cfg, load_cfg = FeatureConfig(), LoaderConfig(batch_size=16)
 
-    # Overall accuracy
-    acc = accuracy_score(y_true, y_pred)
-    print(f"[evaluate] Dummy accuracy: {acc:.3f}")
+    print("[evaluate] Loading dataset...")
+    _, _, test_ds, meta = prepare_datasets(repo_root, feat_cfg, load_cfg, include_icbhi=False)
+    test_dl = DataLoader(test_ds, batch_size=load_cfg.batch_size, shuffle=False)
 
-    # Class-wise metrics
-    classes = ["Nose Breathing", "Mouth Breathing"]  # adjust if needed
-    report = classification_report(y_true, y_pred, target_names=classes, digits=3)
-    print("\n[evaluate] Classification Report:\n")
-    print(report)
+    in_channels = meta["feature_shape"][0]
+    num_classes = len(meta["classes"])
 
-    # Percentage breakdown of predictions
-    total_preds = len(y_pred)
-    if total_preds > 0:
-        nose_pct = (y_pred.count(0) / total_preds) * 100
-        mouth_pct = (y_pred.count(1) / total_preds) * 100
-        print(f"[evaluate] Predictions Breakdown: Nose {nose_pct:.1f}% | Mouth {mouth_pct:.1f}%")
+    print("[evaluate] Loading model from:", model_path)
+    model = CNN_GRU(in_channels, num_classes).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    criterion = nn.CrossEntropyLoss()
 
-    # Confusion matrix heatmap
-    cm = confusion_matrix(y_true, y_pred)
+    print(f"[evaluate] Using device: {DEVICE.upper()}")
+    loss, acc, labels, preds = evaluate(model, test_dl, criterion)
 
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=classes, yticklabels=classes)
+    print("\n✅ Evaluation Complete!")
+    print(f"Test Loss: {loss:.4f} | Test Accuracy: {acc:.4f}")
 
+    # Confusion Matrix
+    cm = confusion_matrix(labels, preds)
+    print("\nConfusion Matrix:\n", cm)
+
+    plt.figure(figsize=(5, 5))
+    plt.imshow(cm, cmap="Blues")
+    plt.title("Confusion Matrix (Evaluation)")
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.title("Confusion Matrix")
-    plt.tight_layout()
-
-    out_path = os.path.join(_project_root(), 'models', 'confusion_matrix.png')
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    plt.savefig(out_path, bbox_inches="tight")
+    plt.colorbar()
+    save_path = os.path.join(repo_root, "mouthbreath_sense", "models", "confusion_matrix_eval.png")
+    plt.savefig(save_path)
     plt.close()
-    print(f"[evaluate] Saved prettier confusion matrix to {out_path}")
+    print(f"[evaluate] Confusion matrix saved to: {save_path}")
 
+    # Classification Report
+    print("\nClassification Report:")
+    print(classification_report(labels, preds, target_names=meta["classes"]))
 
-if __name__ == '__main__':
-    evaluate()
+if __name__ == "__main__":
+    main()
