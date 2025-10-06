@@ -41,3 +41,11 @@ tmp/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Ignore datasets
+mouthbreath_sense/data/raw/
+mouthbreath_sense/data/processed/
+*.wav
+*.webm
+*.json
+
