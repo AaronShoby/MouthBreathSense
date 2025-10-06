@@ -1,0 +1,41 @@
+# =========================
+# General
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+.env
+.venv/
+*.lock
+
+# =========================
+# Datasets
+mouthbreath_sense/data/raw/
+mouthbreath_sense/data/processed/
+*.wav
+*.webm
+*.json
+*.csv
+
+# =========================
+# Models and large files
+*.onnx
+*.pt
+*.pth
+models/*.onnx
+models/*.pt
+models/*.pth
+
+# =========================
+# IDE / OS junk
+.vscode/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Outputs
+runs/
+outputs/
+checkpoints/
