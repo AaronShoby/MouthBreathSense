@@ -1,1 +1,0 @@
-MouthBreathSense project overview.

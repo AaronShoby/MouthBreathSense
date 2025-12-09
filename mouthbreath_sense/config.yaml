@@ -1,5 +1,0 @@
-﻿dataset_path: data/processed/
-model_path: models/model.onnx
-batch_size: 16
-learning_rate: 0.001
-epochs: 3
